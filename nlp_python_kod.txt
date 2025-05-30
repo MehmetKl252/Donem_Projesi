@@ -1,0 +1,184 @@
+import torch
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, TextDataset, DataCollatorForLanguageModeling
+from transformers import Trainer, TrainingArguments
+from google.colab import files
+import re
+import numpy as np
+from sklearn.model_selection import train_test_split
+import os
+
+# Kullanıcıdan model adını al
+model_name = input("Kaydedilecek model için bir isim girin (örneğin, 'my_gpt2_model'): ").strip()
+if not model_name:
+    model_name = "default_gpt2_model"
+print(f"Model adı: {model_name}")
+
+# Model ve dataset yollarını oluştur
+model_save_path = f"./{model_name}"
+dataset_save_path = f"./{model_name}_dataset"
+if not os.path.exists(dataset_save_path):
+    os.makedirs(dataset_save_path)
+
+# Metin dosyasını yükleme
+uploaded = files.upload()
+with open('duzeltilmis_metin_ilave.txt', 'r', encoding='utf-8') as file:
+    text = file.read()
+
+# Satır ve kelime sayısını hesapla
+def count_lines_and_words(text):
+    lines = text.split('\n')
+    num_lines = len(lines)
+    words = text.split()
+    num_words = len(words)
+    return num_lines, num_words
+
+num_lines, num_words = count_lines_and_words(text)
+print(f"Orijinal metin: {num_lines} satır, {num_words} kelime")
+
+# Metni ön işleme (temizleme)
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s.,!?]', '', text)  # Özel karakterleri kaldır
+    text = re.sub(r'\s+', ' ', text)  # Fazla boşlukları temizle
+    return text.strip()
+
+text = preprocess_text(text)
+num_lines_cleaned, num_words_cleaned = count_lines_and_words(text)
+print(f"Temizlenmiş metin: {num_lines_cleaned} satır, {num_words_cleaned} kelime")
+
+# Metni cümlelere ayır
+sentences = text.split('.')
+sentences = [s.strip() for s in sentences if s.strip()]
+print(f"Toplam cümle sayısı: {len(sentences)}")
+
+# Eğitim ve doğrulama setlerine ayır
+if len(sentences) < 5:
+    print("Cümle sayısı çok az, manuel bölme yapılıyor...")
+    train_size = int(len(sentences) * 0.8)
+    train_sentences = sentences[:train_size]
+    val_sentences = sentences[train_size:]
+else:
+    train_sentences, val_sentences = train_test_split(sentences, test_size=0.2, random_state=42)
+
+train_text = '. '.join(train_sentences) + ('.' if train_sentences else '')
+val_text = '. '.join(val_sentences) + ('.' if val_sentences else '')
+
+# Eğitim ve doğrulama metinlerini kaydet
+with open(os.path.join(dataset_save_path, 'train_text.txt'), 'w', encoding='utf-8') as file:
+    file.write(train_text)
+with open(os.path.join(dataset_save_path, 'val_text.txt'), 'w', encoding='utf-8') as file:
+    file.write(val_text)
+
+# GPT-2 tokenizer ve modelini yükle
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.pad_token = tokenizer.eos_token  # Padding token'ı tanımla
+model = GPT2LMHeadModel.from_pretrained('gpt2')
+
+# Eğitim ve doğrulama veri setlerini oluştur
+train_dataset = TextDataset(
+    tokenizer=tokenizer,
+    file_path=os.path.join(dataset_save_path, 'train_text.txt'),
+    block_size=128
+)
+val_dataset = TextDataset(
+    tokenizer=tokenizer,
+    file_path=os.path.join(dataset_save_path, 'val_text.txt'),
+    block_size=128
+)
+
+# Veri kollatoru
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False
+)
+
+# Eğitim argümanlarını ayarla
+training_args = TrainingArguments(
+    output_dir=model_save_path,
+    overwrite_output_dir=True,
+    num_train_epochs=6,  # Epoch sayısını azalttık-tekrar artırdım
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    save_steps=500,  # Daha sık kaydetme
+    save_total_limit=2,
+    logging_dir=os.path.join(model_save_path, 'logs'),
+    logging_steps=100,
+    do_eval=True,
+    eval_steps=100,
+    learning_rate=5e-5,  # Öğrenme oranını tanımla
+    warmup_steps=100,  # Öğrenme oranı ısınma adımları
+)
+
+# Trainer nesnesini oluştur
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    data_collator=data_collator,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+)
+
+# Modeli eğit
+trainer.train()
+
+# Modeli ve tokenizer'ı kaydet
+model.save_pretrained(model_save_path)
+tokenizer.save_pretrained(model_save_path)
+print(f"Model ve tokenizer '{model_save_path}' klasörüne kaydedildi.")
+print(f"Dataset '{dataset_save_path}' klasörüne kaydedildi.")
+
+# Perplexity hesapla
+def compute_perplexity(model, tokenizer, dataset):
+    model.eval()
+    losses = []
+    for batch in torch.utils.data.DataLoader(dataset, batch_size=4, collate_fn=data_collator):
+        inputs = {k: v.to(model.device) for k, v in batch.items() if k != 'labels'}
+        labels = batch['labels'].to(model.device)
+        with torch.no_grad():
+            outputs = model(**inputs, labels=labels)
+            loss = outputs.loss
+            losses.append(loss.item())
+    avg_loss = np.mean(losses)
+    perplexity = np.exp(avg_loss)
+    return perplexity
+
+perplexity = compute_perplexity(model, tokenizer, val_dataset)
+print(f"Doğrulama seti üzerinde Perplexity: {perplexity:.2f}")
+
+# Metin üretme fonksiyonu
+def generate_text(prompt, max_length=200):
+    inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=128, padding=True)
+    input_ids = inputs['input_ids'].to('cuda' if torch.cuda.is_available() else 'cpu')
+    attention_mask = inputs['attention_mask'].to('cuda' if torch.cuda.is_available() else 'cpu')
+    model.eval()
+    outputs = model.generate(
+        input_ids,
+        attention_mask=attention_mask,  # Attention mask kullan
+        max_length=max_length,
+        num_return_sequences=1,
+        no_repeat_ngram_size=3,  # Daha büyük n-gram tekrar önleme
+        do_sample=True,
+        top_k=40,  # Daha sıkı top-k
+        top_p=0.9,  # Daha sıkı top-p
+        temperature=0.5,  # Daha az rastgelelik
+    )
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return generated_text
+
+# Örnek metin üret
+prompt = text[:50]
+generated_text = generate_text(prompt)
+print("Varsayılan prompt ile üretilen metin:")
+print(generated_text)
+
+# Kullanıcıdan prompt al
+user_prompt = input("Metin üretmek için bir başlangıç metni (prompt) girin: ")
+if user_prompt.strip():
+    generated_text = generate_text(user_prompt)
+    print("Kullanıcı prompt'u ile üretilen metin:")
+    print(generated_text)
+else:
+    print("Geçerli bir prompt girilmedi, varsayılan prompt ile devam ediliyor...")
+    generated_text = generate_text(prompt)
+    print("Varsayılan prompt ile üretilen metin:")
+    print(generated_text)
