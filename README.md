@@ -1,1 +1,2 @@
-# Donem_Projesi
+[KilicMehmet/saglik](https://huggingface.co/KilicMehmet/saglik)         
+[KilicMehmet/saglik](https://huggingface.co/datasets/KilicMehmet/turkceSaglik)
